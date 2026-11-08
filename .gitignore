@@ -1,0 +1,11 @@
+__pycache__/
+*.py[co]
+.DS_Store
+work/
+out/
+blobs/
+ffdec/
+ffdec.zip
+*.exe
+*.pdf
+!docs/*.png
