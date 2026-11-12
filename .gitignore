@@ -3,6 +3,9 @@ __pycache__/
 .DS_Store
 work/
 out/
+dist/
+build/
+*.spec
 blobs/
 ffdec/
 ffdec.zip

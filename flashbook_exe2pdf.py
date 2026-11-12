@@ -25,6 +25,12 @@ Requirements : Python 3.7+ and Java (JRE).  `pip install pypdf`.
 Typical use  :
     python3 flashbook_exe2pdf.py "My Book .exe"
     python3 flashbook_exe2pdf.py "Book.exe" -o Book.pdf --extract-only
+
+The engine is also importable from a GUI:
+
+    from flashbook_exe2pdf import convert, Reporter
+    result = convert("Book.exe", rep=Reporter(my_log_callback))
+    # result["out"], result["pages"], ...
 """
 
 import argparse
@@ -42,16 +48,55 @@ import zlib
 try:
     from pypdf import PdfReader, PdfWriter
 except ImportError:
-    sys.exit("pypdf is required:  pip install pypdf")
+    PdfReader = PdfWriter = None
 
 SIGS = (b"FWS", b"CWS")
-FFDEC_URL = ("https://github.com/jindrapetrik/jpexs-decompiler/releases/"
-             "latest/download/ffdec.zip")
+FFDEC_API = "https://api.github.com/repos/jindrapetrik/jpexs-decompiler/releases/latest"
 
 
-def info(msg):    print(f"  [info] {msg}")
-def warn(msg):    print(f"  [WARN] {msg}")
-def step(n, msg): print(f"\n[{n}/6] {msg}")
+class ConvertError(Exception):
+    """Fatal, user-facing conversion error (engine raises; CLI turns into exit)."""
+
+
+# --------------------------------------------------------------------------- #
+# reporting: engine talks through a Reporter, so a GUI can capture it
+# --------------------------------------------------------------------------- #
+class Reporter:
+    """Logging sink.  Override `log` (or pass a callback) to route messages.
+
+    kind is one of: "info", "warn", "step", "done", "plain"
+    """
+
+    def __init__(self, callback=None):
+        self.callback = callback
+
+    def log(self, msg, kind="info"):
+        if self.callback:
+            try:
+                self.callback(msg, kind)
+            except Exception:
+                pass
+        else:
+            prefix = {"info": "  [info] ", "warn": "  [WARN] ",
+                      "done": "  ", "plain": "  "}.get(kind, "  ")
+            print(f"{prefix}{msg}", flush=True)
+
+    def step(self, n, total, msg):
+        self.log(f"[{n}/{total}] {msg}", "step")
+
+
+def _stderr_rep():
+    """Default CLI reporter with the original print behaviour."""
+    rep = Reporter()
+    old = rep.log
+
+    def log(msg, kind="info"):
+        if kind == "step":
+            print(f"\n{msg}", flush=True)
+        else:
+            old(msg, kind)
+    rep.log = log
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -176,7 +221,7 @@ def lex_order(npages: int):
     return sorted(range(1, npages + 1), key=str)
 
 
-def order_by_lex_model(blobs, pages: dict):
+def order_by_lex_model(blobs, pages: dict, rep):
     """
     Model of this packer family:
         blob#1 = book.swf (reader shell)   blob#2 = bookContent.swf (assets)
@@ -185,9 +230,9 @@ def order_by_lex_model(blobs, pages: dict):
     lex = lex_order(len(pages))
     needed = max(lex.index(P) for P in pages) + 3   # 1-based blob count required
     if len(blobs) < needed:
-        warn(f"lex model needs {needed} blobs, found {len(blobs)} - "
-             "falling back to text similarity")
-        return order_by_similarity(blobs, pages)
+        rep.log(f"lex model needs {needed} blobs, found {len(blobs)} - "
+                "falling back to text similarity", "warn")
+        return order_by_similarity(blobs, pages, rep)
 
     checked = score = 0
     for P, text in pages.items():
@@ -201,16 +246,17 @@ def order_by_lex_model(blobs, pages: dict):
         if want & blob_text:
             score += 1
     if checked and score / checked >= 0.85:
-        info(f"lexicographic model verified on {score}/{checked} pages "
-             f"({100.0 * score / checked:.0f}%)")
+        rep.log(f"lexicographic model verified on {score}/{checked} pages "
+                f"({100.0 * score / checked:.0f}%)")
         return [blobs[lex.index(P) + 2].content for P in sorted(pages)]
     if checked:
-        warn(f"lex model weak ({score}/{checked}) - using text similarity")
-    return order_by_similarity(blobs, pages)
+        rep.log(f"lex model weak ({score}/{checked}) - using text similarity",
+                "warn")
+    return order_by_similarity(blobs, pages, rep)
 
 
-def order_by_similarity(blobs, pages: dict):
-    """Best-effort: greedy greedy assignment of blobs to pages by word overlap."""
+def order_by_similarity(blobs, pages: dict, rep):
+    """Best-effort: greedy assignment of blobs to pages by word overlap."""
     ppt = {P: norm_tokens(t) for P, t in sorted(pages.items())}
     bpt = {i: norm_tokens(b.text or "") for i, b in enumerate(blobs)}
     pairs = []
@@ -229,7 +275,8 @@ def order_by_similarity(blobs, pages: dict):
         used_b.add(i); used_p.add(P); match[P] = i
     missing = [P for P in sorted(pages) if P not in match]
     if missing:
-        warn(f"{len(missing)} pages unmatched by text; appended by index order")
+        rep.log(f"{len(missing)} pages unmatched by text; appended by index "
+                "order", "warn")
     out = [blobs[match[P]].content for P in sorted(match)]
     for P in missing:
         guess = int(P) - 1
@@ -238,9 +285,10 @@ def order_by_similarity(blobs, pages: dict):
     return out or [b.content for b in blobs[:len(pages)]]
 
 
-def order_without_index(blobs, n_pages_hint=0):
+def order_without_index(blobs, rep, n_pages_hint=0):
     """No search index: assume blobs after the 2 shell SWFs are pages 1..N."""
-    warn("no search index embedded - assuming storage order == page order")
+    rep.log("no search index embedded - assuming storage order == page order",
+            "warn")
     out = blobs[3:] if len(blobs) > 3 else list(blobs)
     if n_pages_hint:
         out = out[:n_pages_hint]
@@ -250,43 +298,87 @@ def order_without_index(blobs, n_pages_hint=0):
 # --------------------------------------------------------------------------- #
 # ffdec
 # --------------------------------------------------------------------------- #
-def locate_ffdec(explicit: str, workdir: str) -> str:
+def ffdec_cache_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".cache", "flashbook-exe2pdf")
+
+
+def ffdec_download_url(rep) -> str:
+    """Find the current JPEXS release zip (asset names are versioned)."""
+    req = urllib.request.Request(
+        FFDEC_API, headers={"Accept": "application/vnd.github+json",
+                            "User-Agent": "flashbook-exe2pdf"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+        for a in data.get("assets", []):
+            n = a.get("name", "")
+            if (n.startswith("ffdec") and n.endswith(".zip")
+                    and "_lib" not in n and "macosx" not in n):
+                return a["browser_download_url"]
+    except Exception as e:
+        rep.log(f"could not query GitHub releases ({e})", "warn")
+    raise ConvertError("could not locate a ffdec release download - download "
+                       "ffdec manually from https://github.com/jindrapetrik/"
+                       "jpexs-decompiler/releases and pass --ffdec "
+                       "/path/to/ffdec.jar")
+
+
+def locate_ffdec(explicit: str, rep) -> str:
+    """Return a path to ffdec.jar, downloading it on first use."""
     if explicit and os.path.isfile(explicit):
         return explicit
-    cache = os.path.join(os.path.expanduser("~"), ".cache", "flashbook-exe2pdf")
+    cache = ffdec_cache_dir()
     os.makedirs(cache, exist_ok=True)
     jar = os.path.join(cache, "ffdec.jar")
     if os.path.isfile(jar):
+        rep.log(f"using cached ffdec: {jar}")
         return jar
     if shutil.which("java") is None:
-        sys.exit("Java not found - install a JRE (e.g. apt install default-jre)")
-    info("downloading JPEXS ffdec (once, ~22 MB)...")
+        raise ConvertError("Java not found - install a JRE "
+                           "(e.g. apt install default-jre, or adoptium.net)")
+    rep.log("downloading JPEXS ffdec (once, ~30 MB)...", "info")
+    url = ffdec_download_url(rep)
+    rep.log(f"  {url}", "plain")
     tmp = jar + ".zip"
-    urllib.request.urlretrieve(FFDEC_URL, tmp)
+    last = [-1]
+
+    def hook(blocks, bs, total):
+        mb = int(blocks * bs / 1e6)
+        if mb >= last[0] + 5:
+            last[0] = mb
+            rep.log(f"  {mb} MB downloaded...", "plain")
+    urllib.request.urlretrieve(url, tmp, reporthook=hook)
+    rep.log("unpacking ffdec...", "plain")
     subprocess.run(["unzip", "-o", tmp, "-d", cache], check=True,
                    stdout=subprocess.DEVNULL)
     os.remove(tmp)
     if not os.path.isfile(jar):
-        sys.exit("ffdec.jar not found after download")
-    info(f"saved to {jar}")
+        # newer zips may nest; search the cache
+        for root, _, fs in os.walk(cache):
+            if "ffdec.jar" in fs:
+                jar = os.path.join(root, "ffdec.jar")
+                break
+    if not os.path.isfile(jar):
+        raise ConvertError("ffdec.jar not found after download")
+    rep.log(f"saved to {jar}")
     return jar
 
 
-def ffdec_run(cmd, timeout=900):
+def ffdec_run(cmd, timeout=900, rep=None):
     r = subprocess.run(["java", "-Xmx3g", "-Djava.awt.headless=true",
                         "-jar"] + cmd,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                        timeout=timeout)
-    if r.returncode != 0:
-        warn("ffdec exit %s: %s" % (r.returncode, r.stdout[-400:].decode(
-            "utf-8", "replace")))
+    if r.returncode != 0 and rep:
+        rep.log("ffdec exit %s: %s" % (r.returncode, r.stdout[-400:].decode(
+            "utf-8", "replace")), "warn")
     return r
 
 
-def ffdec_texts(jar, blobdir: str, outdir: str) -> dict:
+def ffdec_texts(jar, blobdir: str, outdir: str, rep) -> dict:
     """Dump plain text of every blob (directory input -> per-file subdirs)."""
     ffdec_run([jar, "-format", "text:plain", "-export", "text", outdir,
-               blobdir], timeout=1800)
+               blobdir], timeout=1800, rep=rep)
     texts = {}
     for root, _, fs in os.walk(outdir):
         base = os.path.basename(root)
@@ -302,23 +394,37 @@ def ffdec_texts(jar, blobdir: str, outdir: str) -> dict:
     return texts
 
 
-def ffdec_render(jar, src_swf_dir: str, outdir: str) -> list:
+def ffdec_render(jar, src_swf_dir: str, outdir: str, rep,
+                 progress=None) -> list:
     """Render every (single-frame) SWF in src_swf_dir to one PDF per page.
-       Directory input makes ffdec write out/srcName.swf/frames.pdf, so the
-       mapping back to page number stays trivial."""
-    shutil.rmtree(outdir, ignore_errors=True)
-    os.makedirs(outdir, exist_ok=True)
+       ffdec needs SEPARATE source and output dirs: it writes to
+       <outdir>/<srcName>.swf/frames.pdf, which collides with the input
+       files when outdir == srcdir (seen with ffdec 26.x)."""
     samples = sorted(f for f in os.listdir(src_swf_dir) if f.endswith(".swf"))
-    ffdec_run([jar, "-format", "frame:pdf", "-select", "1",
-               "-export", "frame", outdir, src_swf_dir], timeout=3600)
-    pdfs = []
-    for name in samples:
-        key, _ = os.path.splitext(name)
-        p = os.path.join(outdir, name, "frames.pdf")
-        if not os.path.isfile(p):
-            sys.exit(f"rendering failed for {key}")
-        pdfs.append(p)
-    print(f"  rendered {len(pdfs)} pages")
+    total = len(samples)
+    pdfs, chunk = [], 40
+    for c in range(0, total, chunk):
+        part = samples[c:c + chunk]
+        srcd = os.path.join(outdir, f"in{c:04d}")
+        outd = os.path.join(outdir, f"out{c:04d}")
+        shutil.rmtree(outd, ignore_errors=True)
+        os.makedirs(srcd, exist_ok=True)
+        os.makedirs(outd, exist_ok=True)
+        for src in part:
+            shutil.copyfile(os.path.join(src_swf_dir, src),
+                            os.path.join(srcd, src))
+        ffdec_run([jar, "-format", "frame:pdf", "-select", "1",
+                   "-export", "frame", outd, srcd], timeout=3600, rep=rep)
+        for src in part:
+            key, _ = os.path.splitext(src)
+            p = os.path.join(outd, src, "frames.pdf")
+            if not os.path.isfile(p):
+                raise ConvertError(f"rendering failed for page {key} "
+                                   "(ffdec produced no PDF)")
+            pdfs.append(p)
+        if progress:
+            progress(min(c + chunk, total), total)
+    rep.log(f"rendered {len(pdfs)} pages")
     return pdfs
 
 
@@ -355,6 +461,111 @@ class Blob:
 
 
 # --------------------------------------------------------------------------- #
+# the engine (GUI-callable; no sys.exit inside)
+# --------------------------------------------------------------------------- #
+def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
+            rep=None, progress=None):
+    """
+    Convert one .exe to a PDF.  Returns a dict:
+        {"exe", "out", "pages", "title", "blobs", "workdir",
+         "verified": "100%" | "similarity" | "none" | None}
+    Raises ConvertError (or ValueError from the PE parser) on fatal errors.
+    """
+    if PdfReader is None:
+        raise ConvertError("pypdf is required:  pip install pypdf")
+    rep = rep or Reporter()
+
+    exe = os.path.abspath(exe)
+    if not os.path.isfile(exe):
+        raise ConvertError(f"no such file: {exe}")
+    out = os.path.abspath(out) if out else os.path.splitext(exe)[0] + ".pdf"
+    workdir = workdir or tempfile.mkdtemp(prefix="flashbook_")
+    rep.log(f"input:  {exe}", "plain")
+    rep.log(f"output: {out}", "plain")
+
+    data = open(exe, "rb").read()
+
+    rep.step(1, 6, "locating the appended overlay")
+    try:
+        overlay = pe_overlay_start(data)
+    except ValueError as e:
+        raise ConvertError(str(e)) from None
+    rep.log(f"PE image ends at {overlay:#x}; appended data: "
+            f"{len(data) - overlay:,} bytes", "plain")
+
+    rep.step(2, 6, "parsing manifest and carving embedded SWFs")
+    manifest, blob_start = parse_manifest(data, overlay)
+    if not blob_start:
+        raise ConvertError("no Flip-style manifest found - this tool targets "
+                           "Flash flipbook containers (Flip PDF Professional "
+                           "et al.)")
+    rep.log(f"manifest entries: {len(manifest)}", "plain")
+    blobs = [Blob(off, content) for off, content in walk_blobs(data, blob_start)]
+    rep.log(f"embedded compressed SWFs: {len(blobs)}", "plain")
+    if not blobs:
+        raise ConvertError("no Flash blobs found after the manifest")
+    blobdir = os.path.join(workdir, "blobs")
+    os.makedirs(blobdir, exist_ok=True)
+    for i, b in enumerate(blobs, 1):
+        open(os.path.join(blobdir, f"blob{i:03d}.swf"), "wb").write(b.content)
+
+    if extract_only:
+        json.dump({str(i): b.offset for i, b in enumerate(blobs, 1)},
+                  open(os.path.join(workdir, "offsets.json"), "w"))
+        rep.log(f"[done] {len(blobs)} blobs saved in {blobdir} "
+                "(file order = storage order)", "done")
+        return {"exe": exe, "out": None, "pages": 0, "title": "",
+                "blobs": len(blobs), "workdir": workdir, "verified": None}
+
+    rep.step(3, 6, "searching for the reader's text index (ground truth)")
+    pages = find_search_index(data)
+    title = find_exe_title(data).strip() or "Converted eBook"
+    if pages:
+        rep.log(f"found: {len(pages)} pages of text, title: {title!r}",
+                "plain")
+    else:
+        rep.log("no <Search> index embedded", "info")
+
+    verified = None
+    rep.step(4, 6, "rebuilding the true page order")
+    if pages:
+        jar = locate_ffdec(ffdec, rep)
+        rep.log("extracting blob text with ffdec (for verification)...",
+                "info")
+        texts = ffdec_texts(jar, blobdir, os.path.join(workdir, "texts"), rep)
+        for i, b in enumerate(blobs, 1):
+            b.text = texts.get(f"blob{i:03d}", "")
+        lex = lex_order(len(pages))
+        needed = max(lex.index(P) for P in pages) + 3
+        score_ok = len(blobs) >= needed
+        ordered = order_by_lex_model(blobs, pages, rep)
+        verified = "100%+" if score_ok else "similarity"
+        page_texts = [pages[P] for P in sorted(pages)]
+    else:
+        ordered = order_without_index(blobs, rep)
+        page_texts = [""] * len(ordered)
+
+    rep.step(5, 6, "rendering pages to PDF (JPEXS ffdec)")
+    pagetmp = os.path.join(workdir, "pagetmp")
+    os.makedirs(pagetmp, exist_ok=True)
+    for k, content in enumerate(ordered, 1):
+        open(os.path.join(pagetmp, f"pg{k:03d}.swf"), "wb").write(content)
+    jar = locate_ffdec(ffdec, rep)
+    pdf_files = ffdec_render(jar, pagetmp, os.path.join(workdir, "parts"),
+                             rep, progress=progress)
+
+    rep.step(6, 6, "merging into the final PDF")
+    merge(pdf_files, page_texts, title, out)
+    n = len(PdfReader(out).pages)
+    size_mb = os.path.getsize(out) / 1e6
+    rep.log(f"[OK] {out}  -  {n} pages, {size_mb:.1f} MB", "done")
+    return {"exe": exe, "out": out, "pages": n, "title": title,
+            "blobs": len(blobs), "workdir": workdir, "verified": verified}
+
+
+# --------------------------------------------------------------------------- #
+# CLI (thin wrapper over convert())
+# --------------------------------------------------------------------------- #
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Convert a Flash-style eBook .exe into a real PDF.",
@@ -368,85 +579,13 @@ def main(argv=None):
     ap.add_argument("--ffdec", help="path to ffdec.jar (else auto-download)")
     args = ap.parse_args(argv)
 
-    exe = os.path.abspath(args.exe)
-    if not os.path.isfile(exe):
-        sys.exit(f"no such file: {exe}")
-    out = args.out or os.path.splitext(exe)[0] + ".pdf"
-    workdir = args.workdir or tempfile.mkdtemp(prefix="flashbook_")
-
-    print(f"== flashbook-exe2pdf")
-    print(f"   input:   {exe}")
-    print(f"   output:  {out}")
-    if not args.workdir:
-        print(f"   scratch: {workdir}")
-
-    data = open(exe, "rb").read()
-
-    step(1, "locating the appended overlay")
+    print("== flashbook-exe2pdf")
     try:
-        overlay = pe_overlay_start(data)
-    except ValueError as e:
-        sys.exit(str(e))
-    print(f"  PE image ends at {overlay:#x}; appended data: "
-          f"{len(data) - overlay:,} bytes")
-
-    step(2, "parsing manifest and carving embedded SWFs")
-    manifest, blob_start = parse_manifest(data, overlay)
-    if not blob_start:
-        sys.exit("no Flip-style manifest found - this tool targets Flash "
-                 "flipbook containers (Flip PDF Professional et al.)")
-    print(f"  manifest entries: {len(manifest)}")
-    blobs = [Blob(off, content) for off, content in walk_blobs(data, blob_start)]
-    print(f"  embedded compressed SWFs: {len(blobs)}")
-    if not blobs:
-        sys.exit("no Flash blobs found after the manifest")
-    blobdir = os.path.join(workdir, "blobs")
-    os.makedirs(blobdir, exist_ok=True)
-    for i, b in enumerate(blobs, 1):
-        open(os.path.join(blobdir, f"blob{i:03d}.swf"), "wb").write(b.content)
-    if args.extract_only:
-        json.dump({str(i): b.offset for i, b in enumerate(blobs, 1)},
-                  open(os.path.join(workdir, "offsets.json"), "w"))
-        print(f"\n[done] {len(blobs)} blobs saved in {blobdir} "
-              f"(file order = storage order)")
-        return
-
-    step(3, "searching for the reader's text index (ground truth)")
-    pages = find_search_index(data)
-    title = find_exe_title(data).strip() or "Converted eBook"
-    if pages:
-        print(f"  found: {len(pages)} pages of text, title: {title!r}")
-    else:
-        info("no <Search> index embedded")
-
-    step(4, "rebuilding the true page order")
-    if pages:
-        jar = locate_ffdec(args.ffdec, workdir)
-        info("extracting blob text with ffdec (for verification)...")
-        texts = ffdec_texts(jar, blobdir, os.path.join(workdir, "texts"))
-        for i, b in enumerate(blobs, 1):
-            b.text = texts.get(f"blob{i:03d}", "")
-        ordered = order_by_lex_model(blobs, pages)
-        page_texts = [pages[P] for P in sorted(pages)]
-    else:
-        ordered = order_without_index(blobs)
-        page_texts = [""] * len(ordered)
-
-    step(5, "rendering pages to PDF (JPEXS ffdec)")
-    pagetmp = os.path.join(workdir, "pagetmp")
-    os.makedirs(pagetmp, exist_ok=True)
-    swfs = []
-    for k, content in enumerate(ordered, 1):
-        p = os.path.join(pagetmp, f"pg{k:03d}.swf")
-        open(p, "wb").write(content)
-        swfs.append(p)
-    pdf_files = ffdec_render(locate_ffdec(args.ffdec, workdir), pagetmp,
-                             os.path.join(workdir, "parts"))
-
-    step(6, "merging into the final PDF")
-    merge(pdf_files, page_texts, title, out)
-    n = len(PdfReader(out).pages)
-    print(f"\n[OK] {out}  -  {n} pages, {os.path.getsize(out) // 1024} KB")
+        convert(args.exe, out=args.out, workdir=args.workdir,
+                extract_only=args.extract_only, ffdec=args.ffdec,
+                rep=_stderr_rep())
+    except (ConvertError, OSError, subprocess.SubprocessError) as e:
+        sys.exit(f"\n[error] {e}")
 
 
 if __name__ == "__main__":

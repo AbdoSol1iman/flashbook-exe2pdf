@@ -1,5 +1,7 @@
 # 📖 flashbook-exe2pdf
 
+[![desktop build](https://github.com/AbdoSol1iman/flashbook-exe2pdf/actions/workflows/desktop-build.yml/badge.svg)](https://github.com/AbdoSol1iman/flashbook-exe2pdf/actions/workflows/desktop-build.yml)
+
 Convert old **"eBook .exe"** files (Flash flipbooks made with *Flip PDF Professional* and
 similar tools) into **real PDFs** — vector text you can select and search, embedded fonts,
 all graphics, and a bookmark per page.
@@ -16,7 +18,27 @@ Dead Flash, live book.
 "Natural Language Processing.pdf   ← 207 pages, 12.5 MB, searchable ✔
 ```
 
-## Quick start
+## 🖱 Desktop app (no Python needed)
+
+A minimal cross-platform GUI is included — pick the .exe, click **Start**, get the PDF.
+
+**Download a ready-made binary** (Windows / Linux / macOS, no installation):
+from the repo **[Releases page](https://github.com/AbdoSol1iman/flashbook-exe2pdf/releases)** —
+`FlashBook-Converter-windows.exe`, `FlashBook-Converter-linux`, `FlashBook-Converter-macos`.
+Each build is produced automatically by GitHub Actions on every release tag.
+
+**Run from source instead:**
+
+```bash
+pip install pypdf
+python3 flashbook_gui.py
+```
+
+The GUI still needs **Java** on the machine (the bundled binary checks for it;
+Windows users can grab a JRE from [adoptium.net](https://adoptium.net)). The
+renderer (JPEXS ffdec) is downloaded automatically on first conversion.
+
+## Quick start (command line)
 
 ```bash
 # requirements: python3, java (JRE), and pypdf
@@ -81,6 +103,18 @@ Not supported (yet): standard installers/SFX (use `7z`), DRM-protected readers.
 This tool is the distilled version of a hands-on reverse-engineering session —
 see **[the full step-by-step writeup](docs/writeup.md)** with actual code
 snippets, the ordering forensics, and every bug hit along the way.
+
+## Repository layout
+
+```
+flashbook-exe2pdf/
+├── flashbook_exe2pdf.py   ← conversion engine + CLI (single file, stdlib + pypdf)
+├── flashbook_gui.py       ← minimal Tkinter desktop front-end
+├── .github/workflows/     ← builds the desktop binaries (Win/Linux/macOS)
+├── README.md              ← quick start, how it works, "does my .exe qualify?" table
+├── docs/writeup.md        ← the full forensics writeup with code snippets
+├── LICENSE / .gitignore
+```
 
 ## License
 

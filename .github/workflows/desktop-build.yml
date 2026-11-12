@@ -1,0 +1,72 @@
+name: desktop-build
+
+# Build double-clickable desktop binaries on every push to main and on tags.
+# Artifacts are attached to GitHub Releases for tagged builds.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to upload release assets
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            os_name: windows
+          - os: ubuntu-latest
+            os_name: linux
+          - os: macos-latest
+            os_name: macos
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pypdf pyinstaller
+
+      - name: Build (onefile, no console window)
+        run: >
+          pyinstaller --noconsole --onefile --name FlashBook-Converter
+          --collect-all pypdf flashbook_gui.py
+
+      # Linux: pyinstaller produces a single ELF binary named FlashBook-Converter
+      - name: Rename artifact (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p out
+          cp dist/FlashBook-Converter out/FlashBook-Converter-${{ matrix.os_name }}
+          ls -la out
+
+      - name: Rename artifact (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item dist/FlashBook-Converter.exe out/FlashBook-Converter-windows.exe
+          Get-ChildItem out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlashBook-Converter-${{ matrix.os_name }}
+          path: out/*
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
