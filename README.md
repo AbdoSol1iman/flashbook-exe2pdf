@@ -22,6 +22,8 @@ Dead Flash, live book.
 
 A minimal cross-platform GUI is included — pick the .exe, click **Start**, get the PDF.
 
+![FlashBook Converter GUI](docs/gui.png)
+
 **Download a ready-made binary** (Windows / Linux / macOS, no installation):
 from the repo **[Releases page](https://github.com/AbdoSol1iman/flashbook-exe2pdf/releases)** —
 `FlashBook-Converter-windows.exe`, `FlashBook-Converter-linux`, `FlashBook-Converter-macos`.
