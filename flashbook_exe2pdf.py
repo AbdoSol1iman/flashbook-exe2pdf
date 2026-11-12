@@ -395,7 +395,7 @@ def ffdec_texts(jar, blobdir: str, outdir: str, rep) -> dict:
 
 
 def ffdec_render(jar, src_swf_dir: str, outdir: str, rep,
-                 progress=None) -> list:
+                 progress=None, cancel_check=None) -> list:
     """Render every (single-frame) SWF in src_swf_dir to one PDF per page.
        ffdec needs SEPARATE source and output dirs: it writes to
        <outdir>/<srcName>.swf/frames.pdf, which collides with the input
@@ -404,6 +404,8 @@ def ffdec_render(jar, src_swf_dir: str, outdir: str, rep,
     total = len(samples)
     pdfs, chunk = [], 40
     for c in range(0, total, chunk):
+        if cancel_check and cancel_check():
+            raise ConvertError("Conversion cancelled by user.")
         part = samples[c:c + chunk]
         srcd = os.path.join(outdir, f"in{c:04d}")
         outd = os.path.join(outdir, f"out{c:04d}")
@@ -461,10 +463,77 @@ class Blob:
 
 
 # --------------------------------------------------------------------------- #
+# pre-flight inspection (quick check without full extraction or rendering)
+# --------------------------------------------------------------------------- #
+def inspect_exe(exe: str) -> dict:
+    """
+    Fast pre-flight inspection of an eBook .exe.
+    Returns metadata dict for UI preview and validation.
+    """
+    res = {
+        "valid": False,
+        "size": 0,
+        "is_pe": False,
+        "has_overlay": False,
+        "overlay_offset": 0,
+        "overlay_size": 0,
+        "manifest_count": 0,
+        "indexed_pages": 0,
+        "title": "",
+        "is_flipbook": False,
+        "error": None
+    }
+    if not os.path.isfile(exe):
+        res["error"] = "File does not exist"
+        return res
+    try:
+        size = os.path.getsize(exe)
+        res["size"] = size
+        if size < 1024:
+            res["error"] = "File too small to be an executable"
+            return res
+        
+        with open(exe, "rb") as f:
+            data = f.read()
+
+        if data[:2] != b"MZ":
+            res["error"] = "Not a Windows PE executable (no MZ header)"
+            return res
+        res["is_pe"] = True
+
+        overlay = pe_overlay_start(data)
+        res["has_overlay"] = overlay > 0 and overlay < size
+        res["overlay_offset"] = overlay
+        res["overlay_size"] = max(0, size - overlay)
+
+        if res["has_overlay"]:
+            manifest, _ = parse_manifest(data, overlay)
+            res["manifest_count"] = len(manifest)
+
+        # Title and Search Index
+        title = find_exe_title(data).strip()
+        if title and title != "Converted eBook":
+            res["title"] = title
+        else:
+            base = os.path.splitext(os.path.basename(exe))[0]
+            res["title"] = base
+
+        pages = find_search_index(data)
+        res["indexed_pages"] = len(pages)
+
+        # Qualification check
+        res["is_flipbook"] = (res["manifest_count"] > 0 or b"book.swf" in data or b"bookText.xml" in data)
+        res["valid"] = res["is_pe"] and res["has_overlay"]
+    except Exception as e:
+        res["error"] = str(e)
+    return res
+
+
+# --------------------------------------------------------------------------- #
 # the engine (GUI-callable; no sys.exit inside)
 # --------------------------------------------------------------------------- #
 def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
-            rep=None, progress=None):
+            rep=None, progress=None, cancel_check=None):
     """
     Convert one .exe to a PDF.  Returns a dict:
         {"exe", "out", "pages", "title", "blobs", "workdir",
@@ -475,6 +544,11 @@ def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
         raise ConvertError("pypdf is required:  pip install pypdf")
     rep = rep or Reporter()
 
+    def check_cancel():
+        if cancel_check and cancel_check():
+            raise ConvertError("Conversion cancelled by user.")
+
+    check_cancel()
     exe = os.path.abspath(exe)
     if not os.path.isfile(exe):
         raise ConvertError(f"no such file: {exe}")
@@ -485,6 +559,7 @@ def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
 
     data = open(exe, "rb").read()
 
+    check_cancel()
     rep.step(1, 6, "locating the appended overlay")
     try:
         overlay = pe_overlay_start(data)
@@ -493,6 +568,7 @@ def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
     rep.log(f"PE image ends at {overlay:#x}; appended data: "
             f"{len(data) - overlay:,} bytes", "plain")
 
+    check_cancel()
     rep.step(2, 6, "parsing manifest and carving embedded SWFs")
     manifest, blob_start = parse_manifest(data, overlay)
     if not blob_start:
@@ -507,6 +583,7 @@ def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
     blobdir = os.path.join(workdir, "blobs")
     os.makedirs(blobdir, exist_ok=True)
     for i, b in enumerate(blobs, 1):
+        check_cancel()
         open(os.path.join(blobdir, f"blob{i:03d}.swf"), "wb").write(b.content)
 
     if extract_only:
@@ -517,6 +594,7 @@ def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
         return {"exe": exe, "out": None, "pages": 0, "title": "",
                 "blobs": len(blobs), "workdir": workdir, "verified": None}
 
+    check_cancel()
     rep.step(3, 6, "searching for the reader's text index (ground truth)")
     pages = find_search_index(data)
     title = find_exe_title(data).strip() or "Converted eBook"
@@ -527,6 +605,7 @@ def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
         rep.log("no <Search> index embedded", "info")
 
     verified = None
+    check_cancel()
     rep.step(4, 6, "rebuilding the true page order")
     if pages:
         jar = locate_ffdec(ffdec, rep)
@@ -545,6 +624,7 @@ def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
         ordered = order_without_index(blobs, rep)
         page_texts = [""] * len(ordered)
 
+    check_cancel()
     rep.step(5, 6, "rendering pages to PDF (JPEXS ffdec)")
     pagetmp = os.path.join(workdir, "pagetmp")
     os.makedirs(pagetmp, exist_ok=True)
@@ -552,8 +632,9 @@ def convert(exe, out=None, workdir=None, extract_only=False, ffdec=None,
         open(os.path.join(pagetmp, f"pg{k:03d}.swf"), "wb").write(content)
     jar = locate_ffdec(ffdec, rep)
     pdf_files = ffdec_render(jar, pagetmp, os.path.join(workdir, "parts"),
-                             rep, progress=progress)
+                             rep, progress=progress, cancel_check=cancel_check)
 
+    check_cancel()
     rep.step(6, 6, "merging into the final PDF")
     merge(pdf_files, page_texts, title, out)
     n = len(PdfReader(out).pages)

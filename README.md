@@ -20,7 +20,13 @@ Dead Flash, live book.
 
 ## 🖱 Desktop app (no Python needed)
 
-A minimal cross-platform GUI is included — pick the .exe, click **Start**, get the PDF.
+A modern, cross-platform dark mode desktop GUI is included:
+- **Instant pre-flight inspection**: Automatically inspects the `.exe`, detects book title, embedded SWF assets, page index count, and container compatibility before conversion.
+- **Accurate progress & status**: Live step-by-step indicators with a determinate percentage bar during page rendering (`Rendering pages 40 of 207 (19%)`).
+- **Interactive activity log**: Syntax-highlighted event log with timestamping, one-click `Copy Log`, `Clear`, and auto-scrolling.
+- **Advanced settings**: Collapsible drawer supporting extract-only mode (unpack SWFs without rendering PDF), custom scratch directories, and custom `ffdec.jar` paths for offline setups.
+- **Post-conversion workflow**: Celebratory summary banner with one-click **Open PDF**, **Show in Folder**, and path copying.
+- **Safe cancellation**: Cancel running jobs at any point.
 
 ![FlashBook Converter GUI](docs/gui.png)
 

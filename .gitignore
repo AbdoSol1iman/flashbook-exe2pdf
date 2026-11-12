@@ -12,3 +12,4 @@ ffdec.zip
 *.exe
 *.pdf
 !docs/*.png
+.venv/
